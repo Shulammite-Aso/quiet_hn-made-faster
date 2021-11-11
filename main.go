@@ -35,8 +35,6 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 		duration:   6 * time.Second,
 	}
 
-	// TODO: Use the mutex approach to update and alternate the caches
-
 	// So the go routine below creates a new stories cache every 3 seconds then replaces the previous cache that was in use with it
 
 	go func() {
