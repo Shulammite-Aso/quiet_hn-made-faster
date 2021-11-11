@@ -1,0 +1,176 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gophercises/quiet_hn/hn"
+)
+
+func main() {
+	var port, numStories int
+	flag.IntVar(&port, "port", 3000, "the port to start the web server on")
+	flag.IntVar(&numStories, "num_stories", 30, "the number of top stories to display")
+	flag.Parse()
+
+	tpl := template.Must(template.ParseFiles("./index.gohtml"))
+
+	http.HandleFunc("/", handler(numStories, tpl))
+
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+}
+
+func handler(numStories int, tpl *template.Template) http.HandlerFunc {
+	sc := storyCache{
+		numStories: numStories,
+		duration:   6 * time.Second,
+	}
+
+	// TODO: Use the mutex approach to update and alternate the caches
+
+	// So the go routine below creates a new stories cache every 3 seconds then replaces the previous cache that was in use with it
+
+	go func() {
+		timer := time.NewTicker(3 * time.Second)
+		for {
+			temporaryCache := storyCache{
+				numStories: numStories,
+				duration:   6 * time.Second,
+			}
+			temporaryCache.stories()
+			sc.mutex.Lock()
+			sc.cache = temporaryCache.cache
+			sc.expiration = temporaryCache.expiration
+			sc.mutex.Unlock()
+			<-timer.C
+		}
+	}()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+		stories, err := sc.stories()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data := templateData{
+			Stories: stories,
+			Time:    time.Since(startTime),
+		}
+		err = tpl.Execute(w, data)
+		if err != nil {
+			http.Error(w, "Failed to process the template", http.StatusInternalServerError)
+			return
+		}
+	})
+}
+
+type storyCache struct {
+	numStories int
+	cache      []item
+	expiration time.Time
+	duration   time.Duration
+	mutex      sync.Mutex
+}
+
+func (sc *storyCache) stories() ([]item, error) {
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+	if time.Since(sc.expiration) < 0 {
+		return sc.cache, nil
+	}
+	stories, err := getTopStories(sc.numStories)
+	if err != nil {
+		return nil, err
+	}
+	sc.expiration = time.Now().Add(sc.duration)
+	sc.cache = stories
+	return sc.cache, nil
+}
+
+func getTopStories(numStories int) ([]item, error) {
+	var client hn.Client
+	ids, err := client.TopItems()
+	if err != nil {
+		return nil, errors.New("failed to load top stories")
+	}
+	var stories []item
+	at := 0
+	for len(stories) < numStories {
+		numOfMoreStories := (numStories - len(stories)) * 5 / 4
+		stories = append(stories, getStories(ids[at:at+numOfMoreStories])...)
+		at += numOfMoreStories
+	}
+	return stories[:numStories], nil
+}
+
+func getStories(ids []int) []item {
+	type result struct {
+		index int
+		item  item
+		err   error
+	}
+	resultChannel := make(chan result)
+	for i := 0; i < len(ids); i++ {
+		go func(index, id int) {
+			var client hn.Client
+			hnItem, err := client.GetItem(id)
+			if err != nil {
+				resultChannel <- result{index: index, err: err}
+			}
+			resultChannel <- result{index: index, item: parseHNItem(hnItem)}
+		}(i, ids[i])
+	}
+
+	var results []result
+	for i := 0; i < len(ids); i++ {
+		results = append(results, <-resultChannel)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].index < results[j].index
+	})
+
+	var stories []item
+	for _, res := range results {
+		if res.err != nil {
+			continue
+		}
+		if isStoryLink(res.item) {
+			stories = append(stories, res.item)
+		}
+	}
+	return stories
+}
+
+func isStoryLink(item item) bool {
+	return item.Type == "story" && item.URL != ""
+}
+
+func parseHNItem(hnItem hn.Item) item {
+	ret := item{Item: hnItem}
+	url, err := url.Parse(ret.URL)
+	if err == nil {
+		ret.Host = strings.TrimPrefix(url.Hostname(), "www.")
+	}
+	return ret
+}
+
+// item is the same as the hn.Item, but adds the Host field
+type item struct {
+	hn.Item
+	Host string
+}
+
+type templateData struct {
+	Stories []item
+	Time    time.Duration
+}
